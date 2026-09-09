@@ -1,529 +1,182 @@
-# BountyScope API Guide
+# BountyScope API
 
-BountyScope exposes a JSON API for program intelligence, gated change feeds, and
-AI-assisted smart-contract analysis. This guide is written for customer
-integrations that need repeatable authentication, request examples, response
-shapes, and tier behavior.
+This reference describes the Worker source in this repository. Use your deployed
+Worker origin in place of `https://bountyscope.example` below; deployment and live
+Stripe configuration are separate from source validation.
 
-Production base URL:
+## Routes
 
-```sh
-export BASE_URL="https://bountyscope.ivixivi.workers.dev"
-```
+| Method | Path | Result |
+| --- | --- | --- |
+| GET | `/api/programs` | Tracked programs, ranked by maximum bounty |
+| GET | `/api/changes` | Tiered rolling change feed |
+| POST | `/api/analyze` | AI analysis of code or a protocol description |
+| GET | `/api/whoami` | Resolved tier, authentication, and analyzer usage |
+| POST | `/api/subscribe` | Stripe Checkout URL |
+| POST | `/api/confirm` | Confirm a paid subscription and return an API key |
+| GET | `/api/status` | Program and change status |
 
-All POST endpoints expect JSON and should be called with:
+`/api/pay-status`, USDC quotes, `quote_id`, and `tx_hash` are not part of the current
+checkout HTTP contract.
 
-```http
-Content-Type: application/json
-```
+## Authentication and limits
 
-## Authentication
+Send `Authorization: Bearer bsk_…` or `x-api-key: bsk_…` to gated endpoints.
+An absent, unrecognized, or revoked key receives the free tier. Bearer keys and
+Checkout session IDs should be kept private: an activated session ID can be used
+to recover its existing key.
 
-Paid access uses a BountyScope API key with the `bsk_` prefix.
+| Tier | Change feed | Analyzer |
+| --- | --- | --- |
+| Free | Delayed 24 hours; at most 5 events; no repository detail | 5 calls per UTC day |
+| Pro | Real-time; at most 200 retained events; repository detail | No application quota |
+| Team | Real-time; at most 200 retained events; repository detail | No application quota |
 
-Preferred header:
+The Team policy allows 1,000 results, but the shared rolling log retains only
+200 events (`CHANGE_LOG_CAP`). No tier can retrieve older evicted events.
+The free analyzer quota uses a presented key when available, otherwise client
+IP. Provider limits still apply to paid requests.
 
-```http
-Authorization: Bearer bsk_your_api_key
-```
+## Checkout quick start
 
-Alternative header:
-
-```http
-x-api-key: bsk_your_api_key
-```
-
-Missing, unknown, or revoked keys do not return an auth error. They resolve to
-the free tier, which means `/api/changes` is delayed and capped and
-`/api/analyze` is limited to 5 calls per UTC day.
-
-Check what the API sees:
-
-```sh
-curl "$BASE_URL/api/whoami" \
-  -H "Authorization: Bearer $BOUNTYSCOPE_API_KEY"
-```
-
-Example paid response:
-
-```json
-{
-  "tier": "pro",
-  "authenticated": true,
-  "key_present": true,
-  "analyze_used_today": 0,
-  "analyze_limit": null,
-  "changes_real_time": true,
-  "issued_at": "2026-06-20T14:25:00.000Z"
-}
-```
-
-Treat API keys as bearer secrets. Do not place them in query strings or
-client-side code that untrusted users can read.
-
-## Quick Start: Buy And Use Pro
-
-1. Request a payment quote:
+The backend needs `STRIPE_SECRET_KEY` and the plan-specific `STRIPE_PRICE_PRO` and
+`STRIPE_PRICE_TEAM`. Configure each price for the matching BountyScope plan.
 
 ```sh
-curl -i -X POST "$BASE_URL/api/subscribe" \
-  -H "Content-Type: application/json" \
+curl -X POST https://bountyscope.example/api/subscribe \
+  -H 'Content-Type: application/json' \
   -d '{"tier":"pro"}'
 ```
 
-`/api/subscribe` returns HTTP `402 Payment Required` by design. The response body
-contains the payment instructions.
+HTTP **200**:
 
 ```json
 {
   "status": "payment_required",
   "tier": "pro",
-  "quote_id": "quote_123",
-  "pay_to": {
-    "rail": "crypto",
-    "chain": "base",
-    "asset": "USDC",
-    "address": "0x0000000000000000000000000000000000000049",
-    "amount": "49"
-  },
-  "checkout": null,
-  "instructions": "Send exact USDC amount with the quote id as memo.",
-  "expires_in_seconds": 900,
-  "confirm_url": "/api/confirm"
+  "checkout_url": "https://checkout.stripe.com/c/pay/cs_…"
 }
 ```
 
-2. Send the exact payment shown in `pay_to`, following `instructions`. Keep the
-`quote_id`; it is the payment memo and activation handle.
-
-3. Confirm payment with your transaction hash:
+Open `checkout_url` and complete Stripe Checkout. Stripe redirects to the app
+origin with `?session_id=cs_…`. The app submits that ID to `/api/confirm`:
 
 ```sh
-curl -i -X POST "$BASE_URL/api/confirm" \
-  -H "Content-Type: application/json" \
-  -d '{"quote_id":"quote_123","tx_hash":"0xabc123"}'
+curl -X POST https://bountyscope.example/api/confirm \
+  -H 'Content-Type: application/json' \
+  -d '{"session_id":"cs_test_example"}'
 ```
 
-Successful confirmation returns HTTP `201 Created` and your API key.
+HTTP **201**:
 
 ```json
 {
   "ok": true,
   "tier": "pro",
-  "api_key": "bsk_0123456789abcdef0123456789abcdef0123456789abcdef",
-  "usage": "Send this key as `Authorization: Bearer <key>` or `x-api-key: <key>`...",
-  "receipt": {
-    "id": "receipt_123",
-    "accepted": true
-  }
+  "api_key": "bsk_…",
+  "usage": "Send this key in an Authorization or x-api-key header."
 }
 ```
 
-If you call `/api/confirm` again with an already activated `quote_id`, the API
-returns HTTP `200 OK` with `already_active: true` and the existing key.
+The `usage` string is explanatory. The API key is a bearer secret. Repeating
+confirmation after activation returns HTTP **200**, `already_active: true`, and
+the existing key.
 
-4. Use the key:
+### Subscribe
 
-```sh
-export BOUNTYSCOPE_API_KEY="bsk_0123456789abcdef0123456789abcdef0123456789abcdef"
+`POST /api/subscribe` accepts `{"tier":"pro"}` or `{"tier":"team"}`. The current
+implementation defaults other or omitted tier values to Pro. It creates a
+subscription-mode Checkout session with one item at the configured tier price.
 
-curl "$BASE_URL/api/changes" \
-  -H "Authorization: Bearer $BOUNTYSCOPE_API_KEY"
-```
+| Status | Meaning |
+| --- | --- |
+| 200 | Checkout URL created; payment is still required |
+| 405 | A method other than POST was used |
+| 500 | Stripe secret or selected tier price is missing |
+| 502 | Stripe rejected session creation (`stripe_error`) |
 
-## Tier Behavior
+### Confirm
 
-| Tier | `/api/changes` | Repo detail | `/api/analyze` |
-| --- | --- | --- | --- |
-| Free | Delayed 24 hours, max 5 events | No | 5 calls/day per IP or key |
-| Pro | Real-time, max 200 events | Yes | Unlimited |
-| Team | Real-time, max 1000 events | Yes | Unlimited |
+`POST /api/confirm` accepts a string `session_id` beginning with `cs_` and
+containing only ASCII letters, numbers, or underscores after that prefix.
+Before issuing a new key, the backend retrieves the session with expanded line
+items and checks all of the following:
 
-Quota reset is based on the UTC date. Paid tiers are not currently quota-limited
-for analysis calls.
+- Returned ID equals the requested session ID.
+- Payment is `paid`, session status is `complete`, and mode is `subscription`.
+- `client_reference_id` identifies Pro or Team.
+- The complete line-item list contains exactly one item, quantity one, whose
+  price ID equals that tier's configured BountyScope price.
 
-## Endpoints
+A paid session for another product or a Pro price claiming Team cannot activate
+access. These checks follow the fields on Stripe's
+[Checkout Session object](https://docs.stripe.com/api/checkout/sessions/object)
+and its [expanded line-item retrieval](https://docs.stripe.com/checkout/fulfillment).
 
-| Method | Path | Auth | Purpose |
-| --- | --- | --- | --- |
-| GET | `/api/programs` | Optional | Current tracked program registry |
-| GET | `/api/changes` | Optional, paid key recommended | Tier-gated program change feed |
-| POST | `/api/analyze` | Optional, paid key recommended | Analyze Solidity code or protocol descriptions |
-| GET | `/api/whoami` | Optional | Resolve tier and analysis quota for the presented key |
-| POST | `/api/subscribe` | No | Request a Pro or Team payment quote |
-| POST | `/api/confirm` | No | Confirm payment and mint or recover an API key |
-| GET | `/api/pay-status` | No | Poll payment receipt status by `quote_id` |
-| GET | `/api/status` | No | Service health summary |
+| Status | Meaning |
+| --- | --- |
+| 201 | New key issued |
+| 200 | Session already activated; existing key returned |
+| 400 | Missing/malformed session ID or `invalid_checkout_session` |
+| 402 | Payment/session completion is not confirmed (`payment_not_completed`) |
+| 405 | A method other than POST was used |
+| 500 | Stripe secret is missing |
+| 502 | Stripe session retrieval failed (`stripe_error`) |
 
-## GET /api/programs
+Existing activated keys are not retroactively revalidated. The source currently
+does not enforce subscription renewals, cancellation, or refunds with webhooks.
+KV-based confirmation provides sequential retry behavior; it is not a transaction
+that guarantees a single issuance across concurrent distributed requests.
 
-Returns the tracked program registry, sorted by descending `max_bounty_usd`.
+## Programs and changes
 
-```sh
-curl "$BASE_URL/api/programs"
-```
-
-Example response:
-
-```json
-{
-  "count": 10,
-  "programs": [
-    {
-      "id": "imm-uniswap",
-      "source": "immunefi",
-      "name": "Uniswap V4",
-      "url": "https://immunefi.com/bounty/uniswapv4/",
-      "max_bounty_usd": 15500000,
-      "ecosystem": "ethereum",
-      "in_scope_repos": ["https://github.com/Uniswap/v4-core"],
-      "last_seen_at": "2026-06-20T14:00:00.000Z",
-      "status": "live"
-    }
-  ],
-  "note": "Curated starter list. Cron polls headers every 30min for changes."
-}
-```
-
-Program fields:
-
-| Field | Type | Notes |
-| --- | --- | --- |
-| `id` | string | Stable BountyScope program id |
-| `source` | string | `immunefi`, `code4rena`, `sherlock`, `cantina`, or `curated` |
-| `name` | string | Program display name |
-| `url` | string | Source program URL |
-| `max_bounty_usd` | number | Published maximum bounty when known |
-| `ecosystem` | string | Ecosystem label when known |
-| `in_scope_repos` | string[] | Source repositories when known |
-| `in_scope_contracts` | string[] | Contract addresses when known |
-| `last_seen_at` | string | Last cron observation timestamp |
-| `last_changed_at` | string | Last detected source-header change, when present |
-| `status` | string | `live`, `paused`, or `closed` when known |
-| `notes` | string | Optional operator notes |
-
-## GET /api/changes
-
-Returns the tier-gated change feed, newest first. BountyScope polls tracked
-program URLs every 30 minutes and records events when observed headers change
-after the first fingerprint has been stored.
-
-Free request:
+`GET /api/programs` returns `count`, `programs`, and an explanatory `note`. Programs include
+`id`, `name`, `url`, `source`, `max_bounty_usd`, `ecosystem`, `in_scope_repos`, and
+status/timestamp fields where available. The endpoint seeds the curated program
+list when storage is empty.
 
 ```sh
-curl "$BASE_URL/api/changes"
+curl https://bountyscope.example/api/changes \
+  -H 'Authorization: Bearer bsk_your_key'
 ```
 
-Paid request:
+The change response includes `tier`, `real_time`, `delay_hours`, `count`,
+`total_visible`, and `changes`. Free responses also expose `hidden_by_delay`,
+`capped`, and an explanatory `note`. A change includes program ID/name/URL,
+source, bounty amount where available, and `changed_at`. Paid results can include
+`in_scope_repos`.
+
+Scheduled checks compare Last-Modified or ETag headers using HEAD requests.
+They do not perform repository diffs. A first observed fingerprint establishes
+the baseline; a subsequent different fingerprint creates a change event.
+
+## Analysis
 
 ```sh
-curl "$BASE_URL/api/changes" \
-  -H "Authorization: Bearer $BOUNTYSCOPE_API_KEY"
+curl -X POST https://bountyscope.example/api/analyze \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer bsk_your_key' \
+  -d '{"code":"contract Example {}", "program_id":"example", "repo_url":"https://example.com/repo"}'
 ```
 
-Example free response:
+Provide `code` or `description`; optional fields are `program_id` (default
+`ad-hoc`) and `repo_url`. Input is limited to 60,000 characters. HTTP 200 returns
+`id`, `program_id`, optional `repo_url`, `finding_classes`,
+`attack_surface_summary`, `recommended_focus`, and `generated_at`. Reports are
+stored for 30 days; this API does not expose a report-by-ID route.
 
-```json
-{
-  "tier": "free",
-  "real_time": false,
-  "delay_hours": 24,
-  "count": 5,
-  "total_visible": 18,
-  "hidden_by_delay": 3,
-  "capped": true,
-  "changes": [
-    {
-      "program_id": "imm-aave",
-      "name": "Aave Protocol",
-      "url": "https://immunefi.com/bounty/aave/",
-      "source": "immunefi",
-      "max_bounty_usd": 1000000,
-      "changed_at": "2026-06-18T15:00:00.000Z"
-    }
-  ],
-  "note": "Free feed is delayed 24h, capped at 5 events, and omits in-scope repo detail..."
-}
-```
+Invalid JSON, empty input, or oversized input returns 400. Free quota exhaustion
+returns 402 with `quota_exceeded`, `used`, and `limit`. Unsupported methods return
+405; inference failure returns 500 and malformed analysis output returns 502.
 
-Example paid response:
+## Account and status
 
-```json
-{
-  "tier": "pro",
-  "real_time": true,
-  "delay_hours": 0,
-  "count": 1,
-  "total_visible": 1,
-  "changes": [
-    {
-      "program_id": "imm-aave",
-      "name": "Aave Protocol",
-      "url": "https://immunefi.com/bounty/aave/",
-      "source": "immunefi",
-      "max_bounty_usd": 1000000,
-      "in_scope_repos": ["https://github.com/aave-dao/aave-v3-origin"],
-      "changed_at": "2026-06-20T14:00:00.000Z"
-    }
-  ]
-}
-```
+`GET /api/whoami` returns `tier`, `authenticated`, `key_present`,
+`analyze_used_today`, `analyze_limit` (`null` for paid tiers),
+`changes_real_time`, and `issued_at`.
 
-Recommended polling pattern:
-
-```sh
-curl -s "$BASE_URL/api/changes" \
-  -H "Authorization: Bearer $BOUNTYSCOPE_API_KEY" |
-  jq '.changes[] | {program_id, changed_at, name, in_scope_repos}'
-```
-
-There is no pagination cursor. For scheduled integrations, keep your own
-`changed_at` watermark and ignore events you have already processed.
-
-## POST /api/analyze
-
-Runs a first-pass smart-contract or protocol analysis and stores the report for
-30 days.
-
-Authenticated request:
-
-```sh
-curl -X POST "$BASE_URL/api/analyze" \
-  -H "Authorization: Bearer $BOUNTYSCOPE_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "program_id": "vault-review",
-    "repo_url": "https://github.com/example/vault",
-    "code": "contract Vault { function withdraw(uint256 amount) external { /* ... */ } }"
-  }'
-```
-
-Request body:
-
-| Field | Type | Required | Notes |
-| --- | --- | --- | --- |
-| `code` | string | Required unless `description` is present | Solidity snippet or source content |
-| `description` | string | Required unless `code` is present | Protocol or function description |
-| `program_id` | string | No | Defaults to `ad-hoc` |
-| `repo_url` | string | No | Included in the analysis prompt and report |
-
-The combined `code` or `description` value must be under 60,000 characters.
-Chunk larger projects before submitting.
-
-Example response:
-
-```json
-{
-  "id": "4f2fba03-782a-4543-8b06-ef4b1f3e3b2d",
-  "program_id": "vault-review",
-  "repo_url": "https://github.com/example/vault",
-  "finding_classes": [
-    {
-      "class": "reentrancy",
-      "locations": ["withdraw"],
-      "severity": "high",
-      "rationale": "External call happens before state is reduced."
-    }
-  ],
-  "attack_surface_summary": "The vault exposes an externally callable withdrawal flow...",
-  "recommended_focus": ["withdraw"],
-  "generated_at": "2026-06-20T14:05:00.000Z"
-}
-```
-
-Analysis output is a prioritization aid, not a vulnerability verdict. Validate
-findings against the target program rules and source code before taking action.
-
-Common errors:
-
-| Status | Body | Meaning |
-| --- | --- | --- |
-| 400 | `{"error":"invalid JSON"}` | Request body was not JSON |
-| 400 | `{"error":"missing code or description"}` | Neither `code` nor `description` was provided |
-| 400 | `{"error":"too long; chunk smaller (<60k chars)"}` | Input exceeded the 60,000 character limit |
-| 402 | `{"error":"quota_exceeded", ...}` | Free daily analysis quota is exhausted |
-| 500 | `{"error":"inference: ..."}` | Worker AI inference failed |
-| 502 | `{"error":"analysis output malformed", ...}` | The model response was not parseable JSON |
-
-## GET /api/whoami
-
-Resolves the presented key and reports the analysis quota state.
-
-```sh
-curl "$BASE_URL/api/whoami" \
-  -H "Authorization: Bearer $BOUNTYSCOPE_API_KEY"
-```
-
-Example anonymous response:
-
-```json
-{
-  "tier": "free",
-  "authenticated": false,
-  "key_present": false,
-  "analyze_used_today": 2,
-  "analyze_limit": 5,
-  "changes_real_time": false,
-  "issued_at": null
-}
-```
-
-Field notes:
-
-| Field | Type | Notes |
-| --- | --- | --- |
-| `tier` | string | `free`, `pro`, or `team` |
-| `authenticated` | boolean | True only when the key maps to an active subscription |
-| `key_present` | boolean | True when a key header was sent, even if it is invalid |
-| `analyze_used_today` | number | UTC-day usage count for the resolved identity |
-| `analyze_limit` | number or null | `null` means unlimited under current policy |
-| `changes_real_time` | boolean | True for paid real-time feed access |
-| `issued_at` | string or null | API key issue timestamp for active keys |
-
-## POST /api/subscribe
-
-Creates a pending Pro or Team payment quote.
-
-```sh
-curl -i -X POST "$BASE_URL/api/subscribe" \
-  -H "Content-Type: application/json" \
-  -d '{"tier":"team"}'
-```
-
-Request body:
-
-| Field | Type | Required | Notes |
-| --- | --- | --- | --- |
-| `tier` | string | No | `pro` or `team`; defaults to `pro` |
-
-Response status is `402 Payment Required` when a quote is created.
-
-```json
-{
-  "status": "payment_required",
-  "tier": "team",
-  "quote_id": "quote_123",
-  "pay_to": {
-    "rail": "crypto",
-    "chain": "base",
-    "asset": "USDC",
-    "address": "0x0000000000000000000000000000000000000049",
-    "amount": "199"
-  },
-  "checkout": null,
-  "instructions": "Send exact USDC amount with the quote id as memo.",
-  "expires_in_seconds": 900,
-  "confirm_url": "/api/confirm"
-}
-```
-
-Pending quotes are stored for 7 days. The payment quote itself includes its own
-`expires_in_seconds`; request a fresh quote if the payment rail indicates expiry.
-
-Error responses:
-
-| Status | Body | Meaning |
-| --- | --- | --- |
-| 405 | `POST only` | Wrong method |
-| 502 | `{"error":"rail_unavailable", ...}` | Payment rail could not provide a quote |
-
-## POST /api/confirm
-
-Confirms payment and activates the subscription key.
-
-```sh
-curl -i -X POST "$BASE_URL/api/confirm" \
-  -H "Content-Type: application/json" \
-  -d '{"quote_id":"quote_123","tx_hash":"0xabc123"}'
-```
-
-Request body:
-
-| Field | Type | Required | Notes |
-| --- | --- | --- | --- |
-| `quote_id` | string | Yes | Value returned by `/api/subscribe` |
-| `tx_hash` | string | Yes | Payment transaction hash |
-
-Successful first activation returns `201 Created`. Repeating the same confirmed
-quote returns `200 OK` with `already_active: true`.
-
-Error responses:
-
-| Status | Body | Meaning |
-| --- | --- | --- |
-| 400 | `{"error":"quote_id and tx_hash required"}` | Missing activation fields |
-| 404 | `{"error":"quote_not_found_or_expired"}` | No pending or active quote was found |
-| 405 | `POST only` | Wrong method |
-| 502 | `{"error":"receipt_rejected", ...}` | Payment rail rejected the receipt |
-
-## GET /api/pay-status
-
-Polls payment receipt status by `quote_id`.
-
-```sh
-curl "$BASE_URL/api/pay-status?quote_id=quote_123"
-```
-
-Unpaid response:
-
-```json
-{
-  "paid": false,
-  "quote_id": "quote_123"
-}
-```
-
-Paid response:
-
-```json
-{
-  "paid": true,
-  "receipt": {
-    "ok": true,
-    "quote_id": "quote_123"
-  }
-}
-```
-
-Errors:
-
-| Status | Body | Meaning |
-| --- | --- | --- |
-| 400 | `{"error":"quote_id required"}` | Missing query parameter |
-| 502 | `{"error":"status_unavailable", ...}` | Payment rail status lookup failed |
-
-## GET /api/status
-
-Returns service health and cron state.
-
-```sh
-curl "$BASE_URL/api/status"
-```
-
-Example response:
-
-```json
-{
-  "name": "BountyScope",
-  "program_count": 10,
-  "recent_changes": 1,
-  "last_cron_at": "2026-06-20T14:00:00.000Z"
-}
-```
-
-`recent_changes` is the number of stored programs with `last_changed_at` set.
-Use `/api/changes` for the rolling change log.
-
-## Operational Notes
-
-- The program registry is seeded from a curated starter list if KV is empty.
-- Cron runs every 30 minutes.
-- Change detection uses source `Last-Modified` or `ETag` headers. Some source
-  pages may not expose either header, so always verify high-impact findings
-  against the official program page.
-- First cron observation stores a fingerprint without emitting a change event.
-- Change feed events are capped by tier and by the service's rolling log.
-- There is no webhook endpoint in the current API. Poll `/api/changes` and keep a
-  client-side watermark.
-- Paid keys unlock tier behavior; they do not change the legal scope of any bug
-  bounty program.
+`GET /api/status` exposes program/change counts and status metadata. The current
+main implementation's `last_cron_at` is derived from program timestamps, including
+seeding, so it is not proof that a scheduled run completed. The status/dashboard
+repair is tracked in PR #11; API consumers should treat missing or unverified
+cron/usage measurements as unknown.

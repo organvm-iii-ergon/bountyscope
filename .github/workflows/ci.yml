@@ -23,7 +23,7 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
 
       # No lockfile is committed yet, so `npm install` (not `npm ci`) and no
       # setup-node cache — both require package-lock.json.

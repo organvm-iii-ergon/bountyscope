@@ -1,0 +1,11 @@
+{
+  "agent": "opencode",
+  "status": "idle",
+  "accepting_tasks": true,
+  "available_tokens": 37546615,
+  "available_pct": 75.1,
+  "current_task_id": "HEAL-cifix-organvm-bountyscope-8",
+  "heartbeat": "2026-07-04T07:05:47.162261+00:00",
+  "token_usage_pct": 24.91,
+  "clock_health": "ok"
+}

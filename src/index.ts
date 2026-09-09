@@ -348,14 +348,145 @@ async function handlePrograms(req: Request, env: Env): Promise<Response> {
   });
 }
 
+async function listKVKeys(kv: KVNamespace, prefix: string): Promise<string[]> {
+  const names: string[] = [];
+  let cursor: string | undefined;
+
+  for (let page = 0; page < 20; page += 1) {
+    const result = await kv.list({ prefix, cursor, limit: 1000 });
+    names.push(...result.keys.map(key => key.name));
+    if (result.list_complete || !result.cursor) break;
+    cursor = result.cursor;
+  }
+
+  return names;
+}
+
+async function sumKVNumbers(kv: KVNamespace, keys: string[]): Promise<number> {
+  let total = 0;
+  for (const key of keys) {
+    total += parseInt((await kv.get(key)) ?? '0', 10) || 0;
+  }
+  return total;
+}
+
+function incrementCount(counts: Record<string, number>, key: string) {
+  counts[key] = (counts[key] ?? 0) + 1;
+}
+
+function latestIso(values: Array<string | undefined>): string | null {
+  let latest: string | null = null;
+  let latestMs = -Infinity;
+  for (const value of values) {
+    if (!value) continue;
+    const ms = Date.parse(value);
+    if (!Number.isNaN(ms) && ms > latestMs) {
+      latest = value;
+      latestMs = ms;
+    }
+  }
+  return latest;
+}
+
+function countChangesSince(changes: ChangeEvent[], nowMs: number, windowMs: number): number {
+  return changes.filter(change => {
+    const changedAt = Date.parse(change.changed_at);
+    return !Number.isNaN(changedAt) && nowMs - changedAt <= windowMs;
+  }).length;
+}
+
+function emptyTierCounts(): Record<Tier, number> {
+  return { free: 0, pro: 0, team: 0 };
+}
+
+async function countTiers(kv: KVNamespace, keys: string[]): Promise<Record<Tier, number>> {
+  const tiers = emptyTierCounts();
+  for (const key of keys) {
+    const raw = await kv.get(key);
+    const parsed = tryParseJson(raw);
+    if (!parsed || typeof parsed !== 'object') continue;
+    tiers[normalizeTier((parsed as { tier?: unknown }).tier)] += 1;
+  }
+  return tiers;
+}
+
 async function handleStatus(_req: Request, env: Env): Promise<Response> {
-  const programs = await loadPrograms(env);
+  const programs = await ensureSeeded(env);
+  const changeLog = await loadChangeLog(env);
+  const today = new Date().toISOString().slice(0, 10);
+  const nowMs = Date.now();
   const recentChanges = programs.filter(p => p.last_changed_at).length;
+  const totalMaxBounty = programs.reduce((sum, p) => sum + (p.max_bounty_usd ?? 0), 0);
+  const topProgram = [...programs].sort((a, b) => (b.max_bounty_usd ?? 0) - (a.max_bounty_usd ?? 0))[0] ?? null;
+  const statuses: Record<string, number> = {};
+  const sources: Record<string, number> = {};
+  const ecosystems: Record<string, number> = {};
+  const repoSet = new Set<string>();
+
+  for (const program of programs) {
+    incrementCount(statuses, program.status ?? 'live');
+    incrementCount(sources, program.source);
+    incrementCount(ecosystems, program.ecosystem ?? 'unknown');
+    for (const repo of program.in_scope_repos ?? []) repoSet.add(repo);
+  }
+
+  const [reportKeys, subscriptionKeys, apiKeyKeys, pendingKeys, quotaKeys] = await Promise.all([
+    listKVKeys(env.BS_REPORTS, REPORT_PREFIX),
+    listKVKeys(env.BS_REPORTS, SUB_PREFIX),
+    listKVKeys(env.BS_REPORTS, API_KEY_PREFIX),
+    listKVKeys(env.BS_REPORTS, 'pending:'),
+    listKVKeys(env.BS_REPORTS, `quota:${today}:`),
+  ]);
+  const [freeAnalyzerCallsToday, activeSubscriptionTiers, apiKeyTiers] = await Promise.all([
+    sumKVNumbers(env.BS_REPORTS, quotaKeys),
+    countTiers(env.BS_REPORTS, subscriptionKeys),
+    countTiers(env.BS_REPORTS, apiKeyKeys),
+  ]);
+
   return Response.json({
     name: 'BountyScope',
+    generated_at: new Date().toISOString(),
     program_count: programs.length,
     recent_changes: recentChanges,
-    last_cron_at: programs[0]?.last_seen_at ?? null,
+    logged_changes: changeLog.length,
+    last_cron_at: latestIso(programs.map(p => p.last_seen_at)),
+    programs: {
+      total: programs.length,
+      statuses,
+      live: statuses.live ?? 0,
+      paused: statuses.paused ?? 0,
+      closed: statuses.closed ?? 0,
+      sources,
+      ecosystems,
+      in_scope_repo_count: repoSet.size,
+      total_max_bounty_usd: totalMaxBounty,
+      top_program: topProgram ? {
+        id: topProgram.id,
+        name: topProgram.name,
+        url: topProgram.url,
+        max_bounty_usd: topProgram.max_bounty_usd ?? null,
+      } : null,
+    },
+    changes: {
+      total_logged: changeLog.length,
+      programs_changed: recentChanges,
+      last_24h: countChangesSince(changeLog, nowMs, DAY_MS),
+      last_7d: countChangesSince(changeLog, nowMs, 7 * DAY_MS),
+      last_change_at: latestIso([
+        ...changeLog.map(change => change.changed_at),
+        ...programs.map(p => p.last_changed_at),
+      ]),
+      retention_limit: CHANGE_LOG_CAP,
+    },
+    usage: {
+      analyzer_reports_30d: reportKeys.length,
+      free_analyzer_calls_today: freeAnalyzerCallsToday,
+      active_subscriptions: subscriptionKeys.length,
+      active_subscription_tiers: activeSubscriptionTiers,
+      api_keys_issued: apiKeyKeys.length,
+      api_key_tiers: apiKeyTiers,
+      pending_checkouts: pendingKeys.length,
+    },
   });
 }
 
@@ -427,7 +558,10 @@ async function handleSubscribe(req: Request, env: Env): Promise<Response> {
     return Response.json({ error: 'Stripe is not configured on the backend.' }, { status: 500 });
   }
 
-  const priceId = tier === 'team' ? (env.STRIPE_PRICE_TEAM || 'price_team') : (env.STRIPE_PRICE_PRO || 'price_pro');
+  const priceId = tier === 'team' ? env.STRIPE_PRICE_TEAM : env.STRIPE_PRICE_PRO;
+  if (!priceId) {
+    return Response.json({ error: 'Stripe price is not configured for this tier.' }, { status: 500 });
+  }
   const origin = new URL(req.url).origin;
 
   const params = new URLSearchParams({
@@ -466,7 +600,7 @@ async function handleSubscribe(req: Request, env: Env): Promise<Response> {
 async function handleConfirm(req: Request, env: Env): Promise<Response> {
   if (req.method !== 'POST') return new Response('POST only', { status: 405 });
   const body = await req.json().catch(() => null) as { session_id?: string } | null;
-  if (!body?.session_id) {
+  if (typeof body?.session_id !== 'string' || !/^cs_[A-Za-z0-9_]+$/.test(body.session_id)) {
     return Response.json({ error: 'session_id required' }, { status: 400 });
   }
 
@@ -485,7 +619,9 @@ async function handleConfirm(req: Request, env: Env): Promise<Response> {
     }, { status: 200 });
   }
 
-  const r = await fetch(`https://api.stripe.com/v1/checkout/sessions/${body.session_id}`, {
+  const sessionUrl = new URL(`https://api.stripe.com/v1/checkout/sessions/${body.session_id}`);
+  sessionUrl.searchParams.set('expand[]', 'line_items');
+  const r = await fetch(sessionUrl.toString(), {
     headers: { 'Authorization': `Bearer ${env.STRIPE_SECRET_KEY}` }
   });
 
@@ -494,11 +630,22 @@ async function handleConfirm(req: Request, env: Env): Promise<Response> {
   }
   const session = await r.json() as any;
 
-  if (session.payment_status !== 'paid') {
+  if (!session || session.payment_status !== 'paid' || session.status !== 'complete') {
     return Response.json({ error: 'payment_not_completed' }, { status: 402 });
   }
 
-  const tier = (session.client_reference_id === 'team' ? 'team' : 'pro') as 'pro' | 'team';
+  // A paid session can belong to another product in the same Stripe account.
+  // Bind fulfillment to our configured price and tier, not payment status alone.
+  const tier = session.client_reference_id;
+  const priceId = tier === 'team' ? env.STRIPE_PRICE_TEAM : tier === 'pro' ? env.STRIPE_PRICE_PRO : undefined;
+  const items = session.line_items;
+  if (
+    session.id !== body.session_id || session.mode !== 'subscription' || !priceId ||
+    items?.has_more !== false || !Array.isArray(items?.data) || items.data.length !== 1 ||
+    items.data[0]?.quantity !== 1 || items.data[0]?.price?.id !== priceId
+  ) {
+    return Response.json({ error: 'invalid_checkout_session' }, { status: 400 });
+  }
 
   // Mint the API key that unlocks the paid tier on the gated endpoints.
   const activatedAt = new Date().toISOString();
@@ -520,6 +667,12 @@ async function handleConfirm(req: Request, env: Env): Promise<Response> {
   }, { status: 201 });
 }
 
+function fetchAsset(req: Request, env: Env, pathname: string): Promise<Response> {
+  const url = new URL(req.url);
+  url.pathname = pathname;
+  return env.ASSETS.fetch(new Request(url.toString(), { headers: req.headers, method: req.method }));
+}
+
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     const url = new URL(req.url);
@@ -530,6 +683,7 @@ export default {
     if (url.pathname === '/api/whoami') return handleWhoami(req, env);
     if (url.pathname === '/api/subscribe') return handleSubscribe(req, env);
     if (url.pathname === '/api/confirm') return handleConfirm(req, env);
+    if (url.pathname === '/dashboard' || url.pathname === '/dashboard/') return fetchAsset(req, env, '/dashboard.html');
     return env.ASSETS.fetch(req);
   },
 

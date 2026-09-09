@@ -12,10 +12,11 @@ feed and are authenticated with an API key.
 |-------|----------|----------------------------------------------------------|----------------------------------|----------------------------------------------|
 | Free  | $0       | Delayed **24h**, capped at **5** events, no repo detail   | **5 calls/day** (per IP)         | Public program list                          |
 | Pro   | $49/mo   | **Real-time**, up to **200** events, in-scope repo detail | Unlimited                        | Full program intel + change alerts           |
-| Team  | $199/mo  | **Real-time**, up to **1000** events, in-scope repo detail| Unlimited                        | Everything in Pro + custom watchlists + SLA  |
+| Team  | $199/mo  | **Real-time**, up to **200 retained** events, in-scope repo detail| Unlimited                        | Everything in Pro + custom watchlists + SLA  |
 
-The exact policy lives in one place in code — `TIER_POLICY` in `src/index.ts` — so
-this table and the gate can't drift.
+The policy lives in `TIER_POLICY` in `src/index.ts`. Although the Team policy
+permits 1,000 results, the shared `CHANGE_LOG_CAP` retains only the latest 200
+events, so both paid tiers can currently return at most 200.
 
 ## What "limited / delayed" means on the free tier
 
@@ -31,10 +32,15 @@ this table and the gate can't drift.
 
 1. `POST /api/subscribe` with `{"tier":"pro"}` (or `"team"`) → Returns a Stripe `checkout_url`.
 2. Complete the payment via Stripe Checkout. You will be redirected to the app with a `session_id`.
-3. `POST /api/confirm` with `{"session_id"}`. The session is verified against Stripe, and the response returns your **`api_key`**
-   (`bsk_…`). It is shown once — store it.
+3. `POST /api/confirm` with `{"session_id":"cs_…"}`. The backend requires a complete,
+   paid subscription session containing exactly one item at the configured price
+   for its Pro/Team tier. It returns your **`api_key`** (`bsk_…`); store it safely.
+   Repeating confirmation for an already activated session returns the same key.
 
-BountyScope uses Stripe for all billing and does not process card data directly.
+Checkout requires `STRIPE_SECRET_KEY` and the corresponding `STRIPE_PRICE_PRO` or
+`STRIPE_PRICE_TEAM` configuration. Existing activated keys are retained; this
+implementation does not yet enforce renewals, cancellation, or refunds through
+Stripe webhooks. The current behavior is described in [the API reference](./docs/API.md).
 
 ## Using your API key
 

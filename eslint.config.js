@@ -8,6 +8,22 @@ export default tseslint.config(
   js.configs.recommended,
   ...tseslint.configs.recommended,
   {
+    languageOptions: {
+      globals: {
+        Request: 'readonly',
+        Response: 'readonly',
+        URL: 'readonly',
+        Headers: 'readonly',
+        fetch: 'readonly',
+        console: 'readonly',
+        setTimeout: 'readonly',
+        clearTimeout: 'readonly',
+        setInterval: 'readonly',
+        clearInterval: 'readonly',
+        process: 'readonly',
+        globalThis: 'readonly',
+      }
+    },
     rules: {
       // The Worker leans on `any` for the Workers AI binding and a few JSON
       // boundaries; allow it rather than paper over with bogus types.
@@ -17,6 +33,18 @@ export default tseslint.config(
       // `try { … } catch {}` is a deliberate best-effort pattern here (e.g. HEAD
       // polling that should never throw); empty catch blocks are fine.
       'no-empty': ['error', { allowEmptyCatch: true }],
+    },
+  },
+  {
+    files: ['tests/**/*.mjs', 'test/**/*.mjs'],
+    languageOptions: {
+      globals: {
+        Request: 'readonly',
+        Response: 'readonly',
+        URL: 'readonly',
+        Headers: 'readonly',
+        fetch: 'readonly',
+      },
     },
   },
 );
