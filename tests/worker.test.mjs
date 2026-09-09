@@ -1,5 +1,4 @@
-import assert from 'node:assert/strict';
-import test from 'node:test';
+import { assert, expect, test } from 'vitest';
 
 import worker from '../src/index.ts';
 
@@ -71,50 +70,9 @@ function analysisPayload() {
   };
 }
 
-function makePayrail() {
-  const calls = [];
-
-  return {
-    calls,
-    binding: {
-      async fetch(req) {
-        const url = new URL(req.url);
-        const body = await req.clone().text().catch(() => '');
-        calls.push({ method: req.method, url, headers: new Headers(req.headers), body });
-
-        if (url.pathname === '/pay') {
-          return Response.json({
-            quote_id: 'quote_123',
-            pay_to: {
-              rail: 'crypto',
-              chain: 'base',
-              asset: 'USDC',
-              address: '0x0000000000000000000000000000000000000049',
-              amount: url.searchParams.get('amount'),
-            },
-            checkout: null,
-            instructions: 'Send exact USDC amount with the quote id as memo.',
-            expires_in_seconds: 900,
-          });
-        }
-
-        if (url.pathname === '/receipt' && req.method === 'POST') {
-          return Response.json({ ok: true, receipt: { id: 'receipt_123', accepted: true } });
-        }
-
-        if (url.pathname === '/receipt/quote_123') {
-          return Response.json({ ok: true, quote_id: 'quote_123' });
-        }
-
-        return new Response('not found', { status: 404 });
-      },
-    },
-  };
-}
 
 function makeEnv(overrides = {}) {
   const aiCalls = [];
-  const payrail = makePayrail();
   const assetRequests = [];
 
   const env = {
@@ -133,11 +91,13 @@ function makeEnv(overrides = {}) {
     BS_PROGRAMS: new MemoryKV(),
     BS_REPORTS: new MemoryKV(),
     USER_AGENT: 'BountyScope test bot',
-    PAYRAIL: payrail.binding,
+    STRIPE_SECRET_KEY: 'test_sk_123',
+    STRIPE_PRICE_PRO: 'price_bountyscope_pro',
+    STRIPE_PRICE_TEAM: 'price_bountyscope_team',
     ...overrides,
   };
 
-  return { env, aiCalls, assetRequests, payrailCalls: payrail.calls };
+  return { env, aiCalls, assetRequests };
 }
 
 async function fetchWorker(env, path, init) {
@@ -239,7 +199,7 @@ test('GET /api/changes applies the free delay/cap and unlocks real-time repo det
   assert.equal(paid.body.hidden_by_delay, undefined);
 });
 
-test('GET /api/status returns dashboard coverage and usage metrics', async () => {
+test('GET /api/status returns coverage without enumerating private usage records', async () => {
   const { env } = makeEnv();
   await env.BS_PROGRAMS.put(PROGRAMS_KEY, JSON.stringify([
     {
@@ -276,6 +236,8 @@ test('GET /api/status returns dashboard coverage and usage metrics', async () =>
   const today = new Date().toISOString().slice(0, 10);
   await env.BS_REPORTS.put(`quota:${today}:ip:203.0.113.1`, '3');
   await env.BS_REPORTS.put(`quota:${today}:ip:203.0.113.2`, '2');
+  env.BS_REPORTS.get = env.BS_REPORTS.list = () => { throw new Error('public status must not read account usage'); };
+  env.BS_PROGRAMS.list = () => { throw new Error('public status must not enumerate namespaces'); };
 
   const { response, body } = await fetchJson(env, '/api/status');
 
@@ -284,7 +246,7 @@ test('GET /api/status returns dashboard coverage and usage metrics', async () =>
   assert.equal(body.program_count, 2);
   assert.equal(body.recent_changes, 1);
   assert.equal(body.logged_changes, 2);
-  assert.equal(body.last_cron_at, '2026-06-20T10:30:00.000Z');
+  assert.equal(body.last_cron_at, null);
   assert.equal(body.programs.live, 1);
   assert.equal(body.programs.paused, 1);
   assert.equal(body.programs.total_max_bounty_usd, 350_000);
@@ -295,13 +257,25 @@ test('GET /api/status returns dashboard coverage and usage metrics', async () =>
   assert.equal(body.changes.total_logged, 2);
   assert.equal(body.changes.last_24h, 1);
   assert.equal(body.changes.last_7d, 1);
-  assert.equal(body.usage.analyzer_reports_30d, 2);
-  assert.equal(body.usage.free_analyzer_calls_today, 5);
-  assert.equal(body.usage.active_subscriptions, 2);
-  assert.deepEqual(body.usage.active_subscription_tiers, { free: 0, pro: 1, team: 1 });
-  assert.equal(body.usage.api_keys_issued, 1);
-  assert.deepEqual(body.usage.api_key_tiers, { free: 0, pro: 1, team: 0 });
-  assert.equal(body.usage.pending_checkouts, 1);
+  assert.equal(body.usage.available, false);
+  for (const [field, value] of Object.entries(body.usage)) {
+    if (field !== 'available') assert.equal(value, null);
+  }
+});
+
+test('public status is read-only on empty storage and does not fabricate a cron receipt', async () => {
+  const { env } = makeEnv();
+  const reads = [];
+  const get = env.BS_PROGRAMS.get.bind(env.BS_PROGRAMS);
+  env.BS_PROGRAMS.get = key => { reads.push(key); return get(key); };
+  const { body } = await fetchJson(env, '/api/status');
+  assert.equal(body.program_count, 0);
+  assert.equal(body.last_cron_at, null);
+  assert.deepEqual(reads.sort(), ['changes:log', 'cron:last_completed_at', 'programs:list']);
+  assert.deepEqual(env.BS_PROGRAMS.puts, []);
+  assert.deepEqual(env.BS_REPORTS.puts, []);
+  await fetchJson(env, '/api/programs');
+  assert.equal((await fetchJson(env, '/api/status')).body.last_cron_at, null);
 });
 
 test('POST /api/analyze validates input, persists reports, and enforces the free daily quota', async () => {
@@ -376,56 +350,162 @@ test('paid analyzer calls are authenticated by API key and are not free-quota li
   assert.equal(whoami.body.changes_real_time, true);
 });
 
-test('subscription checkout confirms through payrail, mints an API key, and is idempotent', async () => {
-  const { env, payrailCalls } = makeEnv({ SHIP_HMAC_SECRET: 'secret' });
+for (const tier of ['pro', 'team']) {
+test(`subscription checkout for ${tier} mints an API key and is idempotent`, async () => {
+  const { env } = makeEnv();
+  const originalFetch = globalThis.fetch;
+  const stripeCalls = [];
 
-  const subscribe = await fetchJson(env, '/api/subscribe', jsonRequest({ tier: 'team' }));
+  globalThis.fetch = async (input, init) => {
+    const url = typeof input === 'string' ? input : input.url;
+    stripeCalls.push({ url, method: init?.method, body: init?.body });
+    
+    if (url.includes('/checkout/sessions') && init?.method === 'POST') {
+      return Response.json({
+        id: 'cs_test_123',
+        url: 'https://checkout.stripe.com/pay/cs_test_123'
+      });
+    }
+    
+    if (url.includes('/checkout/sessions/cs_test_123') && init?.method !== 'POST') {
+      return Response.json({
+        id: 'cs_test_123',
+        payment_status: 'paid',
+        status: 'complete',
+        mode: 'subscription',
+        client_reference_id: tier,
+        line_items: { has_more: false, data: [{ quantity: 1, price: { id: `price_bountyscope_${tier}` } }] },
+        amount_total: 19900
+      });
+    }
 
-  assert.equal(subscribe.response.status, 402);
-  assert.equal(subscribe.body.status, 'payment_required');
-  assert.equal(subscribe.body.tier, 'team');
-  assert.equal(subscribe.body.quote_id, 'quote_123');
-  assert.equal(subscribe.body.pay_to.amount, '199');
-  assert.equal(payrailCalls[0].url.pathname, '/pay');
-  assert.equal(payrailCalls[0].url.searchParams.get('sku'), 'bountyscope:team');
-  assert.ok(env.BS_REPORTS.json('pending:quote_123'));
+    return new Response('not found', { status: 404 });
+  };
 
-  const missingFields = await fetchJson(env, '/api/confirm', jsonRequest({ quote_id: 'quote_123' }));
-  assert.equal(missingFields.response.status, 400);
-  assert.equal(missingFields.body.error, 'quote_id and tx_hash required');
+  try {
+    const subscribe = await fetchJson(env, '/api/subscribe', jsonRequest({ tier }));
 
-  const confirm = await fetchJson(env, '/api/confirm', jsonRequest({
-    quote_id: 'quote_123',
-    tx_hash: '0xabc123',
-  }));
+    assert.equal(subscribe.response.status, 200);
+    assert.equal(subscribe.body.status, 'payment_required');
+    assert.equal(subscribe.body.tier, tier);
+    assert.equal(subscribe.body.checkout_url, 'https://checkout.stripe.com/pay/cs_test_123');
 
-  assert.equal(confirm.response.status, 201);
-  assert.equal(confirm.body.ok, true);
-  assert.equal(confirm.body.tier, 'team');
-  assert.match(confirm.body.api_key, /^bsk_[0-9a-f]{48}$/);
-  assert.deepEqual(confirm.body.receipt, { id: 'receipt_123', accepted: true });
-  assert.equal(env.BS_REPORTS.store.has('pending:quote_123'), false);
+    const missingFields = await fetchJson(env, '/api/confirm', jsonRequest({}));
+    assert.equal(missingFields.response.status, 400);
+    assert.equal(missingFields.body.error, 'session_id required');
 
-  const receiptCall = payrailCalls.find(call => call.url.pathname === '/receipt');
-  assert.ok(receiptCall);
-  assert.equal(receiptCall.method, 'POST');
-  assert.ok(receiptCall.headers.get('x-payrail-signature'));
-  assert.match(receiptCall.body, /"sku":"bountyscope:team"/);
+    const confirm = await fetchJson(env, '/api/confirm', jsonRequest({
+      session_id: 'cs_test_123',
+    }));
 
-  const whoami = await fetchJson(env, '/api/whoami', {
-    headers: { authorization: `Bearer ${confirm.body.api_key}` },
+    assert.equal(confirm.response.status, 201);
+    assert.equal(confirm.body.ok, true);
+    assert.equal(confirm.body.tier, tier);
+    const lookup = stripeCalls.find(call => call.method !== 'POST');
+    assert.equal(new URL(lookup.url).searchParams.get('expand[]'), 'line_items');
+    assert.match(confirm.body.api_key, /^bsk_[0-9a-f]{48}$/);
+
+    const whoami = await fetchJson(env, '/api/whoami', {
+      headers: { authorization: `Bearer ${confirm.body.api_key}` },
+    });
+    assert.equal(whoami.body.tier, tier);
+    assert.equal(whoami.body.authenticated, true);
+    assert.equal(whoami.body.key_present, true);
+
+    const repeat = await fetchJson(env, '/api/confirm', jsonRequest({
+      session_id: 'cs_test_123',
+    }));
+    assert.equal(repeat.response.status, 200);
+    assert.equal(repeat.body.already_active, true);
+    assert.equal(repeat.body.api_key, confirm.body.api_key);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+}
+
+for (const [name, invalidFields] of [
+  ['another product price', { line_items: { has_more: false, data: [{ quantity: 1, price: { id: 'price_other_product' } }] } }],
+  ['a Pro price claiming Team', { line_items: { has_more: false, data: [{ quantity: 1, price: { id: 'price_bountyscope_pro' } }] } }],
+  ['a different session ID', { id: 'cs_test_other' }],
+  ['a one-time payment', { mode: 'payment' }],
+  ['an unknown tier', { client_reference_id: 'other' }],
+  ['an absent tier', { client_reference_id: null }],
+  ['an unexpanded price', { line_items: { has_more: false, data: [{ quantity: 1, price: 'price_bountyscope_team' }] } }],
+  ['an incomplete item page', { line_items: { has_more: true, data: [{ quantity: 1, price: { id: 'price_bountyscope_team' } }] } }],
+  ['multiple line items', { line_items: { has_more: false, data: [{ quantity: 1, price: { id: 'price_bountyscope_team' } }, { quantity: 1, price: { id: 'price_other' } }] } }],
+  ['a missing line item', { line_items: null }],
+  ['a zero quantity', { line_items: { has_more: false, data: [{ quantity: 0, price: { id: 'price_bountyscope_team' } }] } }],
+]) {
+  test(`confirm refuses ${name} without issuing an API key`, async () => {
+    const { env } = makeEnv();
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => Response.json({
+      id: 'cs_test_123', payment_status: 'paid', status: 'complete', mode: 'subscription',
+      client_reference_id: 'team',
+      line_items: { has_more: false, data: [{ quantity: 1, price: { id: 'price_bountyscope_team' } }] },
+      ...invalidFields,
+    });
+    try {
+      const result = await fetchJson(env, '/api/confirm', jsonRequest({ session_id: 'cs_test_123' }));
+      assert.equal(result.response.status, 400);
+      assert.equal(result.body.error, 'invalid_checkout_session');
+      assert.equal(env.BS_REPORTS.puts.length, 0);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
-  assert.equal(whoami.body.tier, 'team');
-  assert.equal(whoami.body.authenticated, true);
-  assert.equal(whoami.body.key_present, true);
+}
 
-  const repeat = await fetchJson(env, '/api/confirm', jsonRequest({
-    quote_id: 'quote_123',
-    tx_hash: '0xabc123',
-  }));
-  assert.equal(repeat.response.status, 200);
-  assert.equal(repeat.body.already_active, true);
-  assert.equal(repeat.body.api_key, confirm.body.api_key);
+for (const [paymentStatus, status] of [['unpaid', 'complete'], ['paid', 'open'], ['paid', 'expired']]) {
+  test(`confirm requires completed payment (${paymentStatus}/${status})`, async () => {
+    const { env } = makeEnv();
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => Response.json({
+      id: 'cs_test_123', payment_status: paymentStatus, status, mode: 'subscription',
+      client_reference_id: 'team',
+      line_items: { has_more: false, data: [{ quantity: 1, price: { id: 'price_bountyscope_team' } }] },
+    });
+    try {
+      const result = await fetchJson(env, '/api/confirm', jsonRequest({ session_id: 'cs_test_123' }));
+      assert.equal(result.response.status, 402);
+      assert.equal(env.BS_REPORTS.puts.length, 0);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+}
+
+test('confirm rejects malformed session IDs before a Stripe lookup', async () => {
+  const { env } = makeEnv();
+  const originalFetch = globalThis.fetch;
+  let stripeCalls = 0;
+  globalThis.fetch = async () => { stripeCalls += 1; return Response.json({}); };
+  try {
+    for (const sessionId of [123, {}, 'cs_test_123/line_items', 'cs_test_123?expand[]=customer', 'other']) {
+      const result = await fetchJson(env, '/api/confirm', jsonRequest({ session_id: sessionId }));
+      assert.equal(result.response.status, 400);
+    }
+    assert.equal(stripeCalls, 0);
+    assert.equal(env.BS_REPORTS.puts.length, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('subscribe requires an explicit price for the selected tier', async () => {
+  const { env } = makeEnv({ STRIPE_PRICE_TEAM: undefined });
+  const originalFetch = globalThis.fetch;
+  let stripeCalls = 0;
+  globalThis.fetch = async () => { stripeCalls += 1; return Response.json({}); };
+  try {
+    const result = await fetchJson(env, '/api/subscribe', jsonRequest({ tier: 'team' }));
+    assert.equal(result.response.status, 500);
+    assert.equal(result.body.error, 'Stripe price is not configured for this tier.');
+    assert.equal(stripeCalls, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test('scheduled cron seeds programs, stores HEAD fingerprints, and logs later changes', async () => {
@@ -445,6 +525,10 @@ test('scheduled cron seeds programs, stores HEAD fingerprints, and logs later ch
 
   try {
     await runScheduled(env);
+
+    const completedAt = env.BS_PROGRAMS.store.get('cron:last_completed_at');
+    assert.ok(Number.isFinite(Date.parse(completedAt)));
+    assert.equal((await fetchJson(env, '/api/status')).body.last_cron_at, completedAt);
 
     assert.equal(env.BS_PROGRAMS.json(PROGRAMS_KEY).length, 10);
     assert.equal(env.BS_PROGRAMS.json(CHANGES_KEY), null);
@@ -467,6 +551,16 @@ test('scheduled cron seeds programs, stores HEAD fingerprints, and logs later ch
     assert.equal(env.BS_PROGRAMS.store.get('head:imm-aave'), '"v2"');
   } finally {
     globalThis.fetch = originalFetch;
+  }
+});
+
+test('failed scheduled persistence never creates or advances the completion receipt', async () => {
+  for (const previous of [null, '2026-06-20T00:00:00.000Z']) {
+    const { env } = makeEnv();
+    if (previous) env.BS_PROGRAMS.store.set('cron:last_completed_at', previous);
+    env.BS_PROGRAMS.put = () => { throw new Error('storage unavailable'); };
+    await expect(runScheduled(env)).rejects.toThrow('storage unavailable');
+    assert.equal((await fetchJson(env, '/api/status')).body.last_cron_at, previous);
   }
 });
 

@@ -222,7 +222,7 @@ function esc(value) {
 }
 
 function fmtNumber(value) {
-  return number.format(Number(value || 0));
+  return typeof value === 'number' && Number.isFinite(value) ? number.format(value) : 'Unavailable';
 }
 
 function fmtMoney(value) {
@@ -230,7 +230,7 @@ function fmtMoney(value) {
 }
 
 function fmtDate(value) {
-  if (!value) return 'Never';
+  if (!value) return 'Unknown';
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return 'Unknown';
   return date.toLocaleString([], {
@@ -294,7 +294,7 @@ function statusClass(count) {
 
 function render(data) {
   document.getElementById('generated').textContent =
-    `Generated ${fmtDate(data.generated_at)}. Last cron ${fmtDate(data.last_cron_at)}.`;
+    `Generated ${fmtDate(data.generated_at)}. Last completed scheduled run: ${fmtDate(data.last_cron_at)}. This does not confirm every upstream poll succeeded.`;
 
   const topProgram = data.programs?.top_program;
   document.getElementById('metrics').innerHTML = [
@@ -302,8 +302,8 @@ function render(data) {
     metric('Bounty Coverage', fmtMoney(data.programs?.total_max_bounty_usd), topProgram ? `Top: ${topProgram.name}` : ''),
     metric('Tracked Repos', fmtNumber(data.programs?.in_scope_repo_count), 'In-scope repositories'),
     metric('Logged Changes', fmtNumber(data.changes?.total_logged), `${fmtNumber(data.changes?.last_24h)} in 24h`, data.changes?.last_24h ? 'warn' : ''),
-    metric('Analyzer Reports', fmtNumber(data.usage?.analyzer_reports_30d), 'Rolling 30 day cache'),
-    metric('Active Subs', fmtNumber(data.usage?.active_subscriptions), `${fmtNumber(data.usage?.api_keys_issued)} API keys`)
+    metric('Analyzer Reports', fmtNumber(data.usage?.analyzer_reports_30d), 'Account usage is not exposed publicly'),
+    metric('Active Subs', fmtNumber(data.usage?.active_subscriptions), 'Account usage is not exposed publicly')
   ].join('');
 
   document.getElementById('coverage').innerHTML = tableRows([
@@ -340,6 +340,10 @@ function render(data) {
     ['Pro keys', esc(fmtNumber(keyTiers.pro))],
     ['Team keys', esc(fmtNumber(keyTiers.team))]
   ]);
+  if (data.usage?.available !== true) {
+    document.getElementById('usage').innerHTML = '<p class="empty">Account usage is unavailable on this public status page.</p>';
+    document.getElementById('access').innerHTML = '<p class="empty">Subscription and API key totals are unavailable on this public status page.</p>';
+  }
 }
 
 async function load() {

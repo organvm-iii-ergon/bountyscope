@@ -10,12 +10,19 @@ export default tseslint.config(
   {
     languageOptions: {
       globals: {
+        Request: 'readonly',
+        Response: 'readonly',
         URL: 'readonly',
         Headers: 'readonly',
-        Response: 'readonly',
-        Request: 'readonly',
         fetch: 'readonly',
-      },
+        console: 'readonly',
+        setTimeout: 'readonly',
+        clearTimeout: 'readonly',
+        setInterval: 'readonly',
+        clearInterval: 'readonly',
+        process: 'readonly',
+        globalThis: 'readonly',
+      }
     },
     rules: {
       // The Worker leans on `any` for the Workers AI binding and a few JSON
@@ -26,6 +33,18 @@ export default tseslint.config(
       // `try { … } catch {}` is a deliberate best-effort pattern here (e.g. HEAD
       // polling that should never throw); empty catch blocks are fine.
       'no-empty': ['error', { allowEmptyCatch: true }],
+    },
+  },
+  {
+    files: ['tests/**/*.mjs', 'test/**/*.mjs'],
+    languageOptions: {
+      globals: {
+        Request: 'readonly',
+        Response: 'readonly',
+        URL: 'readonly',
+        Headers: 'readonly',
+        fetch: 'readonly',
+      },
     },
   },
 );
