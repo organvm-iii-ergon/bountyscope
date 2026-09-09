@@ -153,7 +153,7 @@ contract Vault {
   <p><code>GET /api/changes</code> — intel feed; free = delayed 24h + capped, Pro/Team = real-time. Auth: <code>Authorization: Bearer bsk_…</code> or <code>x-api-key: bsk_…</code></p>
   <p><code>POST /api/analyze</code> — body: <code>{code, program_id?, repo_url?}</code> → finding classes (free: 5/day per IP)</p>
   <p><code>GET /api/whoami</code> — tier + quota for the presented key</p>
-  <p><code>POST /api/subscribe</code> — body: <code>{tier}</code> → Stripe checkout URL (402)</p>
+  <p><code>POST /api/subscribe</code> — body: <code>{tier}</code> → Stripe checkout URL (200)</p>
   <p><code>POST /api/confirm</code> — body: <code>{session_id}</code> → returns your <code>api_key</code></p>
   <p><code>GET /api/status</code> — system health</p>
 </section>

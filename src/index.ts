@@ -558,7 +558,10 @@ async function handleSubscribe(req: Request, env: Env): Promise<Response> {
     return Response.json({ error: 'Stripe is not configured on the backend.' }, { status: 500 });
   }
 
-  const priceId = tier === 'team' ? (env.STRIPE_PRICE_TEAM || 'price_team') : (env.STRIPE_PRICE_PRO || 'price_pro');
+  const priceId = tier === 'team' ? env.STRIPE_PRICE_TEAM : env.STRIPE_PRICE_PRO;
+  if (!priceId) {
+    return Response.json({ error: 'Stripe price is not configured for this tier.' }, { status: 500 });
+  }
   const origin = new URL(req.url).origin;
 
   const params = new URLSearchParams({
@@ -597,7 +600,7 @@ async function handleSubscribe(req: Request, env: Env): Promise<Response> {
 async function handleConfirm(req: Request, env: Env): Promise<Response> {
   if (req.method !== 'POST') return new Response('POST only', { status: 405 });
   const body = await req.json().catch(() => null) as { session_id?: string } | null;
-  if (!body?.session_id) {
+  if (typeof body?.session_id !== 'string' || !/^cs_[A-Za-z0-9_]+$/.test(body.session_id)) {
     return Response.json({ error: 'session_id required' }, { status: 400 });
   }
 
@@ -616,7 +619,9 @@ async function handleConfirm(req: Request, env: Env): Promise<Response> {
     }, { status: 200 });
   }
 
-  const r = await fetch(`https://api.stripe.com/v1/checkout/sessions/${body.session_id}`, {
+  const sessionUrl = new URL(`https://api.stripe.com/v1/checkout/sessions/${body.session_id}`);
+  sessionUrl.searchParams.set('expand[]', 'line_items');
+  const r = await fetch(sessionUrl.toString(), {
     headers: { 'Authorization': `Bearer ${env.STRIPE_SECRET_KEY}` }
   });
 
@@ -625,11 +630,22 @@ async function handleConfirm(req: Request, env: Env): Promise<Response> {
   }
   const session = await r.json() as any;
 
-  if (session.payment_status !== 'paid') {
+  if (!session || session.payment_status !== 'paid' || session.status !== 'complete') {
     return Response.json({ error: 'payment_not_completed' }, { status: 402 });
   }
 
-  const tier = (session.client_reference_id === 'team' ? 'team' : 'pro') as 'pro' | 'team';
+  // A paid session can belong to another product in the same Stripe account.
+  // Bind fulfillment to our configured price and tier, not payment status alone.
+  const tier = session.client_reference_id;
+  const priceId = tier === 'team' ? env.STRIPE_PRICE_TEAM : tier === 'pro' ? env.STRIPE_PRICE_PRO : undefined;
+  const items = session.line_items;
+  if (
+    session.id !== body.session_id || session.mode !== 'subscription' || !priceId ||
+    items?.has_more !== false || !Array.isArray(items?.data) || items.data.length !== 1 ||
+    items.data[0]?.quantity !== 1 || items.data[0]?.price?.id !== priceId
+  ) {
+    return Response.json({ error: 'invalid_checkout_session' }, { status: 400 });
+  }
 
   // Mint the API key that unlocks the paid tier on the gated endpoints.
   const activatedAt = new Date().toISOString();

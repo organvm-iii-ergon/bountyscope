@@ -92,6 +92,8 @@ function makeEnv(overrides = {}) {
     BS_REPORTS: new MemoryKV(),
     USER_AGENT: 'BountyScope test bot',
     STRIPE_SECRET_KEY: 'test_sk_123',
+    STRIPE_PRICE_PRO: 'price_bountyscope_pro',
+    STRIPE_PRICE_TEAM: 'price_bountyscope_team',
     ...overrides,
   };
 
@@ -334,7 +336,8 @@ test('paid analyzer calls are authenticated by API key and are not free-quota li
   assert.equal(whoami.body.changes_real_time, true);
 });
 
-test('subscription checkout redirects to Stripe, mints an API key on confirm, and is idempotent', async () => {
+for (const tier of ['pro', 'team']) {
+test(`subscription checkout for ${tier} mints an API key and is idempotent`, async () => {
   const { env } = makeEnv();
   const originalFetch = globalThis.fetch;
   const stripeCalls = [];
@@ -354,7 +357,10 @@ test('subscription checkout redirects to Stripe, mints an API key on confirm, an
       return Response.json({
         id: 'cs_test_123',
         payment_status: 'paid',
-        client_reference_id: 'team',
+        status: 'complete',
+        mode: 'subscription',
+        client_reference_id: tier,
+        line_items: { has_more: false, data: [{ quantity: 1, price: { id: `price_bountyscope_${tier}` } }] },
         amount_total: 19900
       });
     }
@@ -363,11 +369,11 @@ test('subscription checkout redirects to Stripe, mints an API key on confirm, an
   };
 
   try {
-    const subscribe = await fetchJson(env, '/api/subscribe', jsonRequest({ tier: 'team' }));
+    const subscribe = await fetchJson(env, '/api/subscribe', jsonRequest({ tier }));
 
     assert.equal(subscribe.response.status, 200);
     assert.equal(subscribe.body.status, 'payment_required');
-    assert.equal(subscribe.body.tier, 'team');
+    assert.equal(subscribe.body.tier, tier);
     assert.equal(subscribe.body.checkout_url, 'https://checkout.stripe.com/pay/cs_test_123');
 
     const missingFields = await fetchJson(env, '/api/confirm', jsonRequest({}));
@@ -380,13 +386,15 @@ test('subscription checkout redirects to Stripe, mints an API key on confirm, an
 
     assert.equal(confirm.response.status, 201);
     assert.equal(confirm.body.ok, true);
-    assert.equal(confirm.body.tier, 'team');
+    assert.equal(confirm.body.tier, tier);
+    const lookup = stripeCalls.find(call => call.method !== 'POST');
+    assert.equal(new URL(lookup.url).searchParams.get('expand[]'), 'line_items');
     assert.match(confirm.body.api_key, /^bsk_[0-9a-f]{48}$/);
 
     const whoami = await fetchJson(env, '/api/whoami', {
       headers: { authorization: `Bearer ${confirm.body.api_key}` },
     });
-    assert.equal(whoami.body.tier, 'team');
+    assert.equal(whoami.body.tier, tier);
     assert.equal(whoami.body.authenticated, true);
     assert.equal(whoami.body.key_present, true);
 
@@ -396,6 +404,91 @@ test('subscription checkout redirects to Stripe, mints an API key on confirm, an
     assert.equal(repeat.response.status, 200);
     assert.equal(repeat.body.already_active, true);
     assert.equal(repeat.body.api_key, confirm.body.api_key);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+}
+
+for (const [name, invalidFields] of [
+  ['another product price', { line_items: { has_more: false, data: [{ quantity: 1, price: { id: 'price_other_product' } }] } }],
+  ['a Pro price claiming Team', { line_items: { has_more: false, data: [{ quantity: 1, price: { id: 'price_bountyscope_pro' } }] } }],
+  ['a different session ID', { id: 'cs_test_other' }],
+  ['a one-time payment', { mode: 'payment' }],
+  ['an unknown tier', { client_reference_id: 'other' }],
+  ['an absent tier', { client_reference_id: null }],
+  ['an unexpanded price', { line_items: { has_more: false, data: [{ quantity: 1, price: 'price_bountyscope_team' }] } }],
+  ['an incomplete item page', { line_items: { has_more: true, data: [{ quantity: 1, price: { id: 'price_bountyscope_team' } }] } }],
+  ['multiple line items', { line_items: { has_more: false, data: [{ quantity: 1, price: { id: 'price_bountyscope_team' } }, { quantity: 1, price: { id: 'price_other' } }] } }],
+  ['a missing line item', { line_items: null }],
+  ['a zero quantity', { line_items: { has_more: false, data: [{ quantity: 0, price: { id: 'price_bountyscope_team' } }] } }],
+]) {
+  test(`confirm refuses ${name} without issuing an API key`, async () => {
+    const { env } = makeEnv();
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => Response.json({
+      id: 'cs_test_123', payment_status: 'paid', status: 'complete', mode: 'subscription',
+      client_reference_id: 'team',
+      line_items: { has_more: false, data: [{ quantity: 1, price: { id: 'price_bountyscope_team' } }] },
+      ...invalidFields,
+    });
+    try {
+      const result = await fetchJson(env, '/api/confirm', jsonRequest({ session_id: 'cs_test_123' }));
+      assert.equal(result.response.status, 400);
+      assert.equal(result.body.error, 'invalid_checkout_session');
+      assert.equal(env.BS_REPORTS.puts.length, 0);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+}
+
+for (const [paymentStatus, status] of [['unpaid', 'complete'], ['paid', 'open'], ['paid', 'expired']]) {
+  test(`confirm requires completed payment (${paymentStatus}/${status})`, async () => {
+    const { env } = makeEnv();
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => Response.json({
+      id: 'cs_test_123', payment_status: paymentStatus, status, mode: 'subscription',
+      client_reference_id: 'team',
+      line_items: { has_more: false, data: [{ quantity: 1, price: { id: 'price_bountyscope_team' } }] },
+    });
+    try {
+      const result = await fetchJson(env, '/api/confirm', jsonRequest({ session_id: 'cs_test_123' }));
+      assert.equal(result.response.status, 402);
+      assert.equal(env.BS_REPORTS.puts.length, 0);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+}
+
+test('confirm rejects malformed session IDs before a Stripe lookup', async () => {
+  const { env } = makeEnv();
+  const originalFetch = globalThis.fetch;
+  let stripeCalls = 0;
+  globalThis.fetch = async () => { stripeCalls += 1; return Response.json({}); };
+  try {
+    for (const sessionId of [123, {}, 'cs_test_123/line_items', 'cs_test_123?expand[]=customer', 'other']) {
+      const result = await fetchJson(env, '/api/confirm', jsonRequest({ session_id: sessionId }));
+      assert.equal(result.response.status, 400);
+    }
+    assert.equal(stripeCalls, 0);
+    assert.equal(env.BS_REPORTS.puts.length, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('subscribe requires an explicit price for the selected tier', async () => {
+  const { env } = makeEnv({ STRIPE_PRICE_TEAM: undefined });
+  const originalFetch = globalThis.fetch;
+  let stripeCalls = 0;
+  globalThis.fetch = async () => { stripeCalls += 1; return Response.json({}); };
+  try {
+    const result = await fetchJson(env, '/api/subscribe', jsonRequest({ tier: 'team' }));
+    assert.equal(result.response.status, 500);
+    assert.equal(result.body.error, 'Stripe price is not configured for this tier.');
+    assert.equal(stripeCalls, 0);
   } finally {
     globalThis.fetch = originalFetch;
   }

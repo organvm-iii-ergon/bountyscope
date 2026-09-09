@@ -18,8 +18,8 @@ GET  /api/programs          — Tracked Immunefi programs (severity caps, in-sco
 GET  /api/changes           — Intel feed: recent program/repo changes (HEAD diffs). GATED.
 POST /api/analyze           — Analyze a Solidity snippet for known vuln patterns. Free: 5/day.
 GET  /api/whoami            — Tier + remaining quota for the presented API key
-POST /api/subscribe         — { tier } → USDC payment quote (402)
-POST /api/confirm           — { quote_id, tx_hash } → mints your API key
+POST /api/subscribe         — { tier } → Stripe checkout URL (200)
+POST /api/confirm           — { session_id } → verifies the configured Stripe price and returns your API key
 GET  /api/status            — System health
 ```
 
@@ -35,10 +35,13 @@ Full detail in **[PRICING.md](./PRICING.md)**.
 |-------|----------|------------------------------------------|-----------------|
 | Free  | $0       | Delayed 24h, capped at 5, no repo detail | 5 calls/day     |
 | Pro   | $49/mo   | Real-time, ≤200 events, repo detail      | Unlimited       |
-| Team  | $199/mo  | Real-time, ≤1000 events, repo detail     | Unlimited       |
+| Team  | $199/mo  | Real-time, ≤200 retained events, repo detail     | Unlimited       |
 
-**Pay any rail:** GitHub Sponsors, crypto, BMC, latent Stripe. Subscribe → pay USDC
-→ confirm returns a `bsk_…` API key.
+Subscribe → complete Stripe Checkout → confirm returns a `bsk_…` API key.
+The backend requires `STRIPE_SECRET_KEY`, `STRIPE_PRICE_PRO`, and
+`STRIPE_PRICE_TEAM`; each price must identify the corresponding BountyScope plan.
+
+See the **[API reference](./docs/API.md)** for request examples, errors, and current limits.
 
 ## Stack
 

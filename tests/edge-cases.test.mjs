@@ -70,7 +70,7 @@ test('/api/analyze handles malformed AI output', async () => {
 });
 
 test('/api/subscribe handles stripe error', async () => {
-  const env = makeEnv({ STRIPE_SECRET_KEY: 'test_key' });
+  const env = makeEnv({ STRIPE_SECRET_KEY: 'test_key', STRIPE_PRICE_PRO: 'price_bountyscope_pro' });
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async () => new Response('stripe error text', { status: 500 });
   
