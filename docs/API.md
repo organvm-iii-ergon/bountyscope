@@ -175,8 +175,10 @@ returns 402 with `quota_exceeded`, `used`, and `limit`. Unsupported methods retu
 `analyze_used_today`, `analyze_limit` (`null` for paid tiers),
 `changes_real_time`, and `issued_at`.
 
-`GET /api/status` exposes program/change counts and status metadata. The current
-main implementation's `last_cron_at` is derived from program timestamps, including
-seeding, so it is not proof that a scheduled run completed. The status/dashboard
-repair is tracked in PR #11; API consumers should treat missing or unverified
-cron/usage measurements as unknown.
+`GET /api/status` exposes stored program/change counts using three fixed-key reads.
+It does not seed programs, enumerate namespaces, or read account usage records.
+`usage.available` is false and the usage measurements are null, not zero.
+`last_cron_at` records completion of a scheduled run after its program and change
+data was stored; it remains null until such a receipt exists. This timestamp does
+not prove that every upstream poll succeeded. The public `/dashboard` page shows
+unavailable usage and unknown timestamps explicitly.

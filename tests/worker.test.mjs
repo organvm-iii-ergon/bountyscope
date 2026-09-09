@@ -1,4 +1,4 @@
-import { assert, test } from 'vitest';
+import { assert, expect, test } from 'vitest';
 
 import worker from '../src/index.ts';
 
@@ -199,7 +199,7 @@ test('GET /api/changes applies the free delay/cap and unlocks real-time repo det
   assert.equal(paid.body.hidden_by_delay, undefined);
 });
 
-test('GET /api/status returns dashboard coverage and usage metrics', async () => {
+test('GET /api/status returns coverage without enumerating private usage records', async () => {
   const { env } = makeEnv();
   await env.BS_PROGRAMS.put(PROGRAMS_KEY, JSON.stringify([
     {
@@ -236,6 +236,8 @@ test('GET /api/status returns dashboard coverage and usage metrics', async () =>
   const today = new Date().toISOString().slice(0, 10);
   await env.BS_REPORTS.put(`quota:${today}:ip:203.0.113.1`, '3');
   await env.BS_REPORTS.put(`quota:${today}:ip:203.0.113.2`, '2');
+  env.BS_REPORTS.get = env.BS_REPORTS.list = () => { throw new Error('public status must not read account usage'); };
+  env.BS_PROGRAMS.list = () => { throw new Error('public status must not enumerate namespaces'); };
 
   const { response, body } = await fetchJson(env, '/api/status');
 
@@ -244,7 +246,7 @@ test('GET /api/status returns dashboard coverage and usage metrics', async () =>
   assert.equal(body.program_count, 2);
   assert.equal(body.recent_changes, 1);
   assert.equal(body.logged_changes, 2);
-  assert.equal(body.last_cron_at, '2026-06-20T10:30:00.000Z');
+  assert.equal(body.last_cron_at, null);
   assert.equal(body.programs.live, 1);
   assert.equal(body.programs.paused, 1);
   assert.equal(body.programs.total_max_bounty_usd, 350_000);
@@ -255,13 +257,25 @@ test('GET /api/status returns dashboard coverage and usage metrics', async () =>
   assert.equal(body.changes.total_logged, 2);
   assert.equal(body.changes.last_24h, 1);
   assert.equal(body.changes.last_7d, 1);
-  assert.equal(body.usage.analyzer_reports_30d, 2);
-  assert.equal(body.usage.free_analyzer_calls_today, 5);
-  assert.equal(body.usage.active_subscriptions, 2);
-  assert.deepEqual(body.usage.active_subscription_tiers, { free: 0, pro: 1, team: 1 });
-  assert.equal(body.usage.api_keys_issued, 1);
-  assert.deepEqual(body.usage.api_key_tiers, { free: 0, pro: 1, team: 0 });
-  assert.equal(body.usage.pending_checkouts, 1);
+  assert.equal(body.usage.available, false);
+  for (const [field, value] of Object.entries(body.usage)) {
+    if (field !== 'available') assert.equal(value, null);
+  }
+});
+
+test('public status is read-only on empty storage and does not fabricate a cron receipt', async () => {
+  const { env } = makeEnv();
+  const reads = [];
+  const get = env.BS_PROGRAMS.get.bind(env.BS_PROGRAMS);
+  env.BS_PROGRAMS.get = key => { reads.push(key); return get(key); };
+  const { body } = await fetchJson(env, '/api/status');
+  assert.equal(body.program_count, 0);
+  assert.equal(body.last_cron_at, null);
+  assert.deepEqual(reads.sort(), ['changes:log', 'cron:last_completed_at', 'programs:list']);
+  assert.deepEqual(env.BS_PROGRAMS.puts, []);
+  assert.deepEqual(env.BS_REPORTS.puts, []);
+  await fetchJson(env, '/api/programs');
+  assert.equal((await fetchJson(env, '/api/status')).body.last_cron_at, null);
 });
 
 test('POST /api/analyze validates input, persists reports, and enforces the free daily quota', async () => {
@@ -512,6 +526,10 @@ test('scheduled cron seeds programs, stores HEAD fingerprints, and logs later ch
   try {
     await runScheduled(env);
 
+    const completedAt = env.BS_PROGRAMS.store.get('cron:last_completed_at');
+    assert.ok(Number.isFinite(Date.parse(completedAt)));
+    assert.equal((await fetchJson(env, '/api/status')).body.last_cron_at, completedAt);
+
     assert.equal(env.BS_PROGRAMS.json(PROGRAMS_KEY).length, 10);
     assert.equal(env.BS_PROGRAMS.json(CHANGES_KEY), null);
     assert.equal(env.BS_PROGRAMS.store.get('head:imm-aave'), '"v1"');
@@ -533,6 +551,16 @@ test('scheduled cron seeds programs, stores HEAD fingerprints, and logs later ch
     assert.equal(env.BS_PROGRAMS.store.get('head:imm-aave'), '"v2"');
   } finally {
     globalThis.fetch = originalFetch;
+  }
+});
+
+test('failed scheduled persistence never creates or advances the completion receipt', async () => {
+  for (const previous of [null, '2026-06-20T00:00:00.000Z']) {
+    const { env } = makeEnv();
+    if (previous) env.BS_PROGRAMS.store.set('cron:last_completed_at', previous);
+    env.BS_PROGRAMS.put = () => { throw new Error('storage unavailable'); };
+    await expect(runScheduled(env)).rejects.toThrow('storage unavailable');
+    assert.equal((await fetchJson(env, '/api/status')).body.last_cron_at, previous);
   }
 });
 

@@ -47,6 +47,7 @@ interface Program {
 }
 
 const PROGRAMS_KEY = 'programs:list';
+const CRON_COMPLETED_KEY = 'cron:last_completed_at';
 const REPORT_PREFIX = 'report:';
 
 // === Tiers & access gate ===
@@ -241,6 +242,9 @@ async function runCron(env: Env) {
   }
   await savePrograms(env, programs);
   await appendChangeLog(env, events);
+  // A public read may seed program data, but only a completed scheduled run
+  // records this timestamp. It is not proof that each upstream poll succeeded.
+  await env.BS_PROGRAMS.put(CRON_COMPLETED_KEY, new Date().toISOString());
   console.log(`bountyscope: cron run, ${programs.length} programs, ${events.length} changed`);
 }
 
@@ -348,28 +352,6 @@ async function handlePrograms(req: Request, env: Env): Promise<Response> {
   });
 }
 
-async function listKVKeys(kv: KVNamespace, prefix: string): Promise<string[]> {
-  const names: string[] = [];
-  let cursor: string | undefined;
-
-  for (let page = 0; page < 20; page += 1) {
-    const result = await kv.list({ prefix, cursor, limit: 1000 });
-    names.push(...result.keys.map(key => key.name));
-    if (result.list_complete || !result.cursor) break;
-    cursor = result.cursor;
-  }
-
-  return names;
-}
-
-async function sumKVNumbers(kv: KVNamespace, keys: string[]): Promise<number> {
-  let total = 0;
-  for (const key of keys) {
-    total += parseInt((await kv.get(key)) ?? '0', 10) || 0;
-  }
-  return total;
-}
-
 function incrementCount(counts: Record<string, number>, key: string) {
   counts[key] = (counts[key] ?? 0) + 1;
 }
@@ -395,25 +377,12 @@ function countChangesSince(changes: ChangeEvent[], nowMs: number, windowMs: numb
   }).length;
 }
 
-function emptyTierCounts(): Record<Tier, number> {
-  return { free: 0, pro: 0, team: 0 };
-}
-
-async function countTiers(kv: KVNamespace, keys: string[]): Promise<Record<Tier, number>> {
-  const tiers = emptyTierCounts();
-  for (const key of keys) {
-    const raw = await kv.get(key);
-    const parsed = tryParseJson(raw);
-    if (!parsed || typeof parsed !== 'object') continue;
-    tiers[normalizeTier((parsed as { tier?: unknown }).tier)] += 1;
-  }
-  return tiers;
-}
-
 async function handleStatus(_req: Request, env: Env): Promise<Response> {
-  const programs = await ensureSeeded(env);
-  const changeLog = await loadChangeLog(env);
-  const today = new Date().toISOString().slice(0, 10);
+  // Public status has a fixed three-key read budget, regardless of customer
+  // count. It neither enumerates account records nor initializes stored data.
+  const [programs, changeLog, completedAt] = await Promise.all([
+    loadPrograms(env), loadChangeLog(env), env.BS_PROGRAMS.get(CRON_COMPLETED_KEY),
+  ]);
   const nowMs = Date.now();
   const recentChanges = programs.filter(p => p.last_changed_at).length;
   const totalMaxBounty = programs.reduce((sum, p) => sum + (p.max_bounty_usd ?? 0), 0);
@@ -430,26 +399,13 @@ async function handleStatus(_req: Request, env: Env): Promise<Response> {
     for (const repo of program.in_scope_repos ?? []) repoSet.add(repo);
   }
 
-  const [reportKeys, subscriptionKeys, apiKeyKeys, pendingKeys, quotaKeys] = await Promise.all([
-    listKVKeys(env.BS_REPORTS, REPORT_PREFIX),
-    listKVKeys(env.BS_REPORTS, SUB_PREFIX),
-    listKVKeys(env.BS_REPORTS, API_KEY_PREFIX),
-    listKVKeys(env.BS_REPORTS, 'pending:'),
-    listKVKeys(env.BS_REPORTS, `quota:${today}:`),
-  ]);
-  const [freeAnalyzerCallsToday, activeSubscriptionTiers, apiKeyTiers] = await Promise.all([
-    sumKVNumbers(env.BS_REPORTS, quotaKeys),
-    countTiers(env.BS_REPORTS, subscriptionKeys),
-    countTiers(env.BS_REPORTS, apiKeyKeys),
-  ]);
-
   return Response.json({
     name: 'BountyScope',
     generated_at: new Date().toISOString(),
     program_count: programs.length,
     recent_changes: recentChanges,
     logged_changes: changeLog.length,
-    last_cron_at: latestIso(programs.map(p => p.last_seen_at)),
+    last_cron_at: latestIso([completedAt ?? undefined]),
     programs: {
       total: programs.length,
       statuses,
@@ -479,13 +435,14 @@ async function handleStatus(_req: Request, env: Env): Promise<Response> {
       retention_limit: CHANGE_LOG_CAP,
     },
     usage: {
-      analyzer_reports_30d: reportKeys.length,
-      free_analyzer_calls_today: freeAnalyzerCallsToday,
-      active_subscriptions: subscriptionKeys.length,
-      active_subscription_tiers: activeSubscriptionTiers,
-      api_keys_issued: apiKeyKeys.length,
-      api_key_tiers: apiKeyTiers,
-      pending_checkouts: pendingKeys.length,
+      available: false,
+      analyzer_reports_30d: null,
+      free_analyzer_calls_today: null,
+      active_subscriptions: null,
+      active_subscription_tiers: null,
+      api_keys_issued: null,
+      api_key_tiers: null,
+      pending_checkouts: null,
     },
   });
 }
