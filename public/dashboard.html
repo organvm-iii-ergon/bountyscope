@@ -264,7 +264,7 @@ function rows(items) {
 function tableRows(items) {
   return items.map(([label, value]) => `
     <tr>
-      <th>${esc(label)}</th>
+      <th scope="row">${esc(label)}</th>
       <td>${value}</td>
     </tr>
   `).join('');
